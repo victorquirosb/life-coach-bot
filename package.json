@@ -1,0 +1,19 @@
+{
+  "name": "life-coach-bot",
+  "version": "1.0.0",
+  "description": "Bot coach de vida con IA - Cuerpo, Hogar, Trabajo",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "setup": "mkdir -p data && node scripts/setup-db.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.30.0",
+    "better-sqlite3": "^11.0.0",
+    "dayjs": "^1.11.0",
+    "dotenv": "^16.0.0",
+    "grammy": "^1.30.0",
+    "node-cron": "^3.0.0"
+  }
+}
