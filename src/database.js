@@ -199,9 +199,12 @@ const getTodayTasks = () => {
 };
 const addTask = (pillar, description, followUpMinutes = null, dueDate = null) => {
   const result = run('INSERT INTO tasks (pillar, description, due_date) VALUES (?, ?, ?)', [pillar, description, dueDate]);
-  if (followUpMinutes && result.lastInsertRowid) {
+  console.log(`  📋 addTask debug: followUpMinutes=${followUpMinutes}, lastInsertRowid=${result.lastInsertRowid}`);
+  if (followUpMinutes) {
     const triggerAt = dayjs().add(followUpMinutes, 'minute').format('YYYY-MM-DD HH:mm:ss');
-    run('INSERT INTO dynamic_triggers (trigger_at, type, context, task_id) VALUES (?, ?, ?, ?)', [triggerAt, 'task_follow_up', JSON.stringify({ description }), result.lastInsertRowid]);
+    const taskId = result.lastInsertRowid || null;
+    run('INSERT INTO dynamic_triggers (trigger_at, type, context, task_id) VALUES (?, ?, ?, ?)', [triggerAt, 'task_follow_up', JSON.stringify({ description }), taskId]);
+    console.log(`  ⏰ Trigger dinámico creado para: ${triggerAt}`);
   }
   return result;
 };
