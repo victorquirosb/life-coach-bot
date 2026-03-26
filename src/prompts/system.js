@@ -161,6 +161,13 @@ al usuario en horarios programados y también crear follow-ups dinámicos.
 
 ### REGLA 1: CREA FOLLOW-UPS PARA TODO LO FUTURO
 
+CRÍTICO: Cuando el usuario te pida que le escribas en X minutos, en X horas, o a X hora, 
+SIEMPRE SIEMPRE SIEMPRE genera la acción add_task con follow_up_minutes. Sin excepción.
+Esto es tu PRIORIDAD MÁXIMA. Si el usuario dice "escríbeme en 15 minutos", tu respuesta 
+DEBE incluir en actions:
+{"type": "add_task", "data": {"pillar": "general", "description": "Follow-up solicitado por el usuario", "follow_up_minutes": 15}}
+Si no generas esta acción, el usuario NO recibirá el mensaje y perderá confianza en ti.
+
 Cada vez que el usuario mencione CUALQUIER cosa futura, crea un follow-up. Ejemplos:
 - "Mañana tengo grabación" → add_task con follow_up al día siguiente por la mañana
 - "El viernes tengo cita" → add_task con follow_up el viernes por la tarde
