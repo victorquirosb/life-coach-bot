@@ -28,12 +28,14 @@ async function chat(userMessage, triggerContext = null) {
     profile, goals, inventory, routines, tasks, todayLog, revenueData, config
   );
 
-  // 3. Construir mensajes con historial
+  // 3. Construir mensajes con historial (filtrar vacíos)
   const history = db.getRecentConversations(20);
-  const messages = history.map(h => ({
-    role: h.role,
-    content: h.content,
-  }));
+  const messages = history
+    .filter(h => h.content && h.content.trim() !== '')
+    .map(h => ({
+      role: h.role,
+      content: h.content,
+    }));
 
   // Añadir contexto del trigger si es proactivo
   let fullMessage = userMessage;
