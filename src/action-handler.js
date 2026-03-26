@@ -9,8 +9,9 @@ function processActions(actions) {
       switch (action.type) {
         case 'add_task': {
           const { pillar, description, follow_up_minutes, due_date } = action.data;
-          db.addTask(pillar, description, follow_up_minutes || null, due_date || null);
-          console.log(`  ✅ Tarea creada: ${description}`);
+          const minutes = follow_up_minutes || action.data.followUpMinutes || action.data.follow_up || null;
+          db.addTask(pillar || 'general', description, minutes, due_date || null);
+          console.log(`  ✅ Tarea creada: ${description}${minutes ? ` (follow-up en ${minutes} min)` : ''}`);
           break;
         }
 
