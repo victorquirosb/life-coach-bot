@@ -10,19 +10,19 @@ async function main() {
   await initDatabase();
 
   const bot = createBot();
-
   const chatId = process.env.TELEGRAM_CHAT_ID;
-  
+
   if (!chatId) {
-    console.warn('⚠️ TELEGRAM_CHAT_ID no configurado.\n');
+    console.warn('⚠️ TELEGRAM_CHAT_ID no configurado — mensajes proactivos desactivados.');
   }
 
   setSendMessage(async (message) => {
-    if (!chatId) return;
+    if (!chatId || !message) return;
     try {
       if (message.length <= 4096) {
         await bot.api.sendMessage(chatId, message);
       } else {
+        // Split long messages
         for (let i = 0; i < message.length; i += 4096) {
           await bot.api.sendMessage(chatId, message.substring(i, i + 4096));
         }
@@ -34,10 +34,13 @@ async function main() {
 
   startScheduler();
 
-  console.log('\n🤖 Bot de Telegram iniciado. Esperando mensajes...\n');
+  console.log('\n🤖 Bot listo. Esperando mensajes...\n');
   bot.start({
-    onStart: () => console.log('✅ Bot conectado a Telegram'),
+    onStart: () => console.log('✅ Conectado a Telegram'),
   });
 }
 
-main().catch(console.error);
+main().catch((err) => {
+  console.error('💀 Error fatal al iniciar:', err);
+  process.exit(1);
+});

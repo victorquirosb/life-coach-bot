@@ -6,7 +6,46 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
-async function chat(userMessage, triggerContext = null) {
+/**
+ * Build clean message history for the API.
+ * Rules:
+ *  - No empty messages
+ *  - No consecutive same-role messages (merge them)
+ *  - No exact duplicate content in a row
+ *  - Must start with 'user' role
+ *  - Trim to reasonable token budget
+ */
+function buildMessageHistory(limit = 20) {
+  const raw = db.getRecentConversations(limit);
+  const messages = [];
+
+  for (const h of raw) {
+    const content = (h.content || '').trim();
+    if (!content) continue;
+
+    // Skip if exact same content as previous message
+    if (messages.length > 0 && messages[messages.length - 1].content === content) continue;
+
+    if (messages.length > 0 && messages[messages.length - 1].role === h.role) {
+      // Merge consecutive same-role messages
+      messages[messages.length - 1].content += '\n\n' + content;
+    } else {
+      messages.push({ role: h.role, content });
+    }
+  }
+
+  // Ensure first message is from 'user' (API requirement)
+  while (messages.length > 0 && messages[0].role !== 'user') {
+    messages.shift();
+  }
+
+  return messages;
+}
+
+/**
+ * Gather all context data for the system prompt.
+ */
+function gatherContext() {
   const profile = db.getProfile();
   const goals = db.getActiveGoals();
   const inventory = db.getInventory();
@@ -14,64 +53,106 @@ async function chat(userMessage, triggerContext = null) {
   const tasks = db.getTodayTasks();
   const todayLog = db.getTodayLog();
   const config = db.getAllConfig();
-  
   const revenueData = {
     weekTotal: db.getWeekRevenue(),
     monthTotal: db.getMonthRevenue(),
     weekGoal: config.week_revenue_goal || null,
     monthGoal: config.month_revenue_goal || null,
   };
+  return { profile, goals, inventory, routines, tasks, todayLog, revenueData, config };
+}
+
+/**
+ * Parse Claude's response — tries JSON, then fenced JSON, then plain text fallback.
+ */
+function parseResponse(text) {
+  // Try direct JSON parse
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed.message) return parsed;
+  } catch (_) {}
+
+  // Try fenced JSON block
+  const jsonMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[1]);
+      if (parsed.message) return parsed;
+    } catch (_) {}
+  }
+
+  // Try to find JSON object in text
+  const braceMatch = text.match(/\{[\s\S]*"message"\s*:\s*"[\s\S]*?\}/);
+  if (braceMatch) {
+    try {
+      const parsed = JSON.parse(braceMatch[0]);
+      if (parsed.message) return parsed;
+    } catch (_) {}
+  }
+
+  // Fallback: treat entire text as message
+  return { message: text, actions: [] };
+}
+
+/**
+ * Main chat function.
+ * @param {string} userMessage - User's message (empty string for proactive triggers)
+ * @param {object|null} triggerContext - Context for proactive messages
+ * @returns {object} { message, actions }
+ */
+async function chat(userMessage, triggerContext = null) {
+  const ctx = gatherContext();
+  const isProactive = !!triggerContext;
+  const now = db.getNow();
+
+  // Build extra context string for proactive triggers
+  let extraContext = null;
+  if (triggerContext) {
+    extraContext = `Tipo: ${triggerContext.type}\n${triggerContext.context}\nHORA EXACTA: ${now.format('HH:mm')} — FECHA: ${now.format('DD/MM/YYYY')}`;
+  }
 
   const systemPrompt = buildSystemPrompt(
-    profile, goals, inventory, routines, tasks, todayLog, revenueData, config
+    ctx.profile, ctx.goals, ctx.inventory, ctx.routines,
+    ctx.tasks, ctx.todayLog, ctx.revenueData, ctx.config,
+    extraContext
   );
 
-  // Construir mensajes con historial (filtrar vacíos y duplicados)
-  const history = db.getRecentConversations(20);
-  const messages = [];
-  let lastRole = null;
-  let lastContent = null;
-  
-  for (const h of history) {
-    if (!h.content || h.content.trim() === '') continue;
-    if (h.content === lastContent) continue;
-    if (h.role === lastRole && messages.length > 0) {
-      messages[messages.length - 1].content += '\n' + h.content;
-      lastContent = h.content;
-      continue;
-    }
-    messages.push({ role: h.role, content: h.content });
-    lastRole = h.role;
-    lastContent = h.content;
-  }
+  // Build message array
+  const history = buildMessageHistory(20);
 
-  let fullMessage = userMessage;
-  if (triggerContext) {
-    fullMessage = `[CONTEXTO DEL SISTEMA - el bot está iniciando contacto proactivo]
-Tipo de trigger: ${triggerContext.type}
-Contexto: ${triggerContext.context}
-HORA REAL ACTUAL: ${new Date().toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })}
-[FIN CONTEXTO]
-
-Genera un mensaje proactivo apropiado para este momento. NO digas que eres un bot ni 
-que esto es automático. Escribe como si fueras un amigo que le escribe en ese momento.`;
-  }
-
-  if (fullMessage && fullMessage.trim() !== '') {
-    messages.push({ role: 'user', content: fullMessage });
+  // Add current message
+  if (isProactive) {
+    // For proactive: add a system-style user message that tells Claude this is a trigger
+    const triggerMsg = `[TRIGGER PROACTIVO — ${triggerContext.type}]\n`
+      + `El sistema te pide que generes un mensaje proactivo. Escribe como si le escribieras tú al usuario por iniciativa propia. No menciones que es un trigger automático.\n`
+      + `Contexto: ${triggerContext.context}`;
+    history.push({ role: 'user', content: triggerMsg });
+  } else if (userMessage && userMessage.trim()) {
+    history.push({ role: 'user', content: userMessage.trim() });
   } else {
-    messages.push({ role: 'user', content: 'Genera un mensaje proactivo basado en el contexto actual del usuario.' });
+    // Safety: never send empty user message
+    history.push({ role: 'user', content: '(el usuario envió un mensaje vacío)' });
   }
 
-  // Asegurar que los mensajes alternan correctamente
+  // Final cleanup: ensure alternation
   const cleanMessages = [];
-  for (let i = 0; i < messages.length; i++) {
-    if (i === 0 && messages[i].role === 'assistant') continue;
-    if (cleanMessages.length > 0 && cleanMessages[cleanMessages.length - 1].role === messages[i].role) {
-      cleanMessages[cleanMessages.length - 1].content += '\n' + messages[i].content;
+  for (const msg of history) {
+    if (!msg.content || !msg.content.trim()) continue;
+    if (cleanMessages.length > 0 && cleanMessages[cleanMessages.length - 1].role === msg.role) {
+      cleanMessages[cleanMessages.length - 1].content += '\n\n' + msg.content;
     } else {
-      cleanMessages.push({ ...messages[i] });
+      cleanMessages.push({ ...msg });
     }
+  }
+
+  // Ensure starts with user
+  while (cleanMessages.length > 0 && cleanMessages[0].role !== 'user') {
+    cleanMessages.shift();
+  }
+
+  // Must have at least one message
+  if (cleanMessages.length === 0) {
+    cleanMessages.push({ role: 'user', content: 'Hola' });
   }
 
   try {
@@ -83,30 +164,33 @@ que esto es automático. Escribe como si fueras un amigo que le escribe en ese m
     });
 
     const responseText = response.content[0].text;
+    const parsed = parseResponse(responseText);
 
-    let parsed;
-    try {
-      parsed = JSON.parse(responseText);
-    } catch {
-      const jsonMatch = responseText.match(/```json\n?([\s\S]*?)\n?```/);
-      if (jsonMatch) {
-        parsed = JSON.parse(jsonMatch[1]);
-      } else {
-        parsed = { message: responseText, actions: [] };
-      }
-    }
+    // Ensure actions is always an array
+    if (!Array.isArray(parsed.actions)) parsed.actions = [];
 
-    if (userMessage && userMessage.trim() !== '') {
-      db.addConversation('user', userMessage);
+    // Save to conversation history
+    if (!isProactive && userMessage && userMessage.trim()) {
+      db.addConversation('user', userMessage.trim(), false);
     }
-    db.addConversation('assistant', parsed.message);
+    if (parsed.message && parsed.message.trim()) {
+      db.addConversation('assistant', parsed.message.trim(), isProactive);
+    }
 
     return parsed;
 
   } catch (error) {
-    console.error('Error llamando a Claude:', error.message);
+    console.error('❌ Error llamando a Claude:', error.message);
+
+    // If it's a content error, log more detail
+    if (error.status === 400) {
+      console.error('   Request had', cleanMessages.length, 'messages');
+      console.error('   First role:', cleanMessages[0]?.role);
+      console.error('   Last role:', cleanMessages[cleanMessages.length - 1]?.role);
+    }
+
     return {
-      message: 'Tengo un problema técnico ahora mismo. Dame un minuto y vuelve a intentarlo.',
+      message: 'Problema técnico. Dame un momento.',
       actions: [],
     };
   }
