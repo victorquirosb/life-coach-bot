@@ -5,103 +5,146 @@ const { chat } = require('./claude');
 const { buildTriggerContext } = require('./context-builder');
 const { processActions } = require('./action-handler');
 
-let sendMessageFn = null; // Se inyecta desde index.js
+let sendMessageFn = null;
+let lastProactiveMessage = 0;
+let proactiveCountToday = 0;
+let lastProactiveDate = '';
+let userSaidStop = false;
 
 function setSendMessage(fn) {
   sendMessageFn = fn;
 }
 
-async function executeProactiveTrigger(triggerType, extraContext = null) {
-  // Verificar modo silencio
-  if (db.getConfig('silent_mode') === 'true') {
-    console.log(`🔇 Trigger ${triggerType} suprimido (modo silencio)`);
-    return;
+function userResumed() {
+  userSaidStop = false;
+}
+
+function userRequestedSilence() {
+  userSaidStop = true;
+}
+
+const MIN_INTERVAL_MS = 45 * 60 * 1000;
+const MAX_PROACTIVE_PER_DAY = 8;
+
+function canSendProactive() {
+  const now = Date.now();
+  const today = dayjs().format('YYYY-MM-DD');
+  
+  if (today !== lastProactiveDate) {
+    proactiveCountToday = 0;
+    lastProactiveDate = today;
   }
+  
+  if (userSaidStop) {
+    console.log('🔇 Bloqueado: usuario pidió silencio');
+    return false;
+  }
+  
+  if (db.getConfig('silent_mode') === 'true') {
+    console.log('🔇 Bloqueado: modo silencio activado');
+    return false;
+  }
+  
+  if (now - lastProactiveMessage < MIN_INTERVAL_MS) {
+    const minutesLeft = Math.round((MIN_INTERVAL_MS - (now - lastProactiveMessage)) / 60000);
+    console.log(`⏳ Bloqueado: faltan ${minutesLeft} min para poder enviar otro mensaje`);
+    return false;
+  }
+  
+  if (proactiveCountToday >= MAX_PROACTIVE_PER_DAY) {
+    console.log('🚫 Bloqueado: límite diario alcanzado');
+    return false;
+  }
+  
+  return true;
+}
+
+function markProactiveSent() {
+  lastProactiveMessage = Date.now();
+  proactiveCountToday++;
+  console.log(`📊 Mensajes proactivos hoy: ${proactiveCountToday}/${MAX_PROACTIVE_PER_DAY}`);
+}
+
+async function executeProactiveTrigger(triggerType, extraContext = null) {
+  if (!canSendProactive()) return;
 
   console.log(`🔔 Ejecutando trigger: ${triggerType}`);
   
   const context = extraContext || buildTriggerContext(triggerType);
   
+  const realTime = dayjs().format('HH:mm');
+  const realDate = dayjs().format('DD/MM/YYYY');
+  if (context && typeof context.context === 'string') {
+    context.context = context.context + `\nHORA REAL ACTUAL: ${realTime}. FECHA: ${realDate}. USA ESTA HORA, NO INVENTES OTRA.`;
+  }
+  
   try {
     const response = await chat('', context);
     
-    // Procesar acciones
     if (response.actions && response.actions.length > 0) {
       processActions(response.actions);
     }
     
-    // Enviar mensaje al usuario
     if (sendMessageFn && response.message) {
       await sendMessageFn(response.message);
+      markProactiveSent();
     }
   } catch (error) {
-    console.error(`❌ Error en trigger ${triggerType}:`, error);
+    console.error(`❌ Error en trigger ${triggerType}:`, error.message);
   }
 }
 
 function startScheduler() {
   const config = db.getAllConfig();
 
-  // ================================
-  // TRIGGERS FIJOS (CRON JOBS)
-  // ================================
-
-  // Mensaje de buenos días
   const [morningH, morningM] = (config.morning_time || '07:30').split(':');
   cron.schedule(`${morningM} ${morningH} * * *`, () => {
     executeProactiveTrigger('morning');
   });
 
-  // Check de almuerzo
   const [lunchH, lunchM] = (config.lunch_check || '13:30').split(':');
   cron.schedule(`${lunchM} ${lunchH} * * *`, () => {
     executeProactiveTrigger('lunch_check');
   });
 
-  // Check de trabajo (tarde)
   const [afterH, afterM] = (config.afternoon_check || '17:00').split(':');
   cron.schedule(`${afterM} ${afterH} * * *`, () => {
     executeProactiveTrigger('afternoon_work');
   });
 
-  // Check de cena
   const [evenH, evenM] = (config.evening_check || '20:30').split(':');
   cron.schedule(`${evenM} ${evenH} * * *`, () => {
     executeProactiveTrigger('evening_check');
   });
 
-  // Revisión nocturna
   const [nightH, nightM] = (config.night_review || '23:00').split(':');
   cron.schedule(`${nightM} ${nightH} * * *`, () => {
     executeProactiveTrigger('night_review');
   });
 
-  // Viernes prep (solo viernes)
   const [friH, friM] = (config.friday_prep || '18:00').split(':');
   cron.schedule(`${friM} ${friH} * * 5`, () => {
     executeProactiveTrigger('friday_prep');
   });
 
-  // Domingo review (solo domingos)
   const [sunH, sunM] = (config.sunday_review || '20:00').split(':');
   cron.schedule(`${sunM} ${sunH} * * 0`, () => {
     executeProactiveTrigger('sunday_review');
   });
 
-  // ================================
-  // VERIFICADOR DE TRIGGERS DINÁMICOS
-  // (cada 2 minutos revisa si hay algo pendiente)
-  // ================================
-  cron.schedule('*/2 * * * *', async () => {
+  cron.schedule('* * * * *', async () => {
     const triggers = db.getPendingTriggers();
     
     for (const trigger of triggers) {
-      // Marcar como ejecutado primero (evitar duplicados)
       db.markTriggerExecuted(trigger.id);
       
-      // Si es follow-up de tarea y la tarea ya está completada, skip
       if (trigger.type === 'task_follow_up' && trigger.task_status === 'done') {
         console.log(`⏭️ Follow-up de tarea #${trigger.task_id} omitido (ya completada)`);
+        continue;
+      }
+
+      if (!canSendProactive()) {
+        console.log(`⏭️ Trigger ${trigger.id} bloqueado por control de frecuencia`);
         continue;
       }
 
@@ -113,14 +156,11 @@ function startScheduler() {
       };
 
       await executeProactiveTrigger(trigger.type, context);
+      break;
     }
   });
 
-  // ================================
-  // DETECTOR DE INACTIVIDAD
-  // (cada 30 minutos revisa si el usuario está inactivo)
-  // ================================
-  cron.schedule('*/30 * * * *', () => {
+  cron.schedule('0 * * * *', () => {
     const thresholdHours = parseInt(config.inactivity_threshold_hours || '3');
     const lastMessage = db.getRecentConversations(1)[0];
     
@@ -128,7 +168,6 @@ function startScheduler() {
       const lastTime = dayjs(lastMessage.created_at);
       const hoursSince = dayjs().diff(lastTime, 'hour');
       
-      // Solo entre las 8:00 y las 22:00, y si han pasado suficientes horas
       const currentHour = dayjs().hour();
       if (hoursSince >= thresholdHours && currentHour >= 8 && currentHour <= 22) {
         executeProactiveTrigger('inactivity');
@@ -144,8 +183,9 @@ function startScheduler() {
   console.log(`   📊 Cierre: ${config.night_review || '23:00'}`);
   console.log(`   🎉 Viernes prep: ${config.friday_prep || '18:00'}`);
   console.log(`   📋 Domingo review: ${config.sunday_review || '20:00'}`);
-  console.log(`   🔄 Triggers dinámicos: cada 2 min`);
-  console.log(`   👀 Detector inactividad: cada 30 min`);
+  console.log(`   🔄 Triggers dinámicos: cada 1 min (max 1 por ciclo)`);
+  console.log(`   👀 Detector inactividad: cada 1 hora`);
+  console.log(`   ⚡ Límites: ${MAX_PROACTIVE_PER_DAY} msgs/día, ${MIN_INTERVAL_MS/60000} min entre msgs`);
 }
 
-module.exports = { startScheduler, setSendMessage };
+module.exports = { startScheduler, setSendMessage, userResumed, userRequestedSilence };

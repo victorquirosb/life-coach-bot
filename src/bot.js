@@ -1,23 +1,18 @@
 const { Bot } = require('grammy');
 const { chat } = require('./claude');
 const { processActions } = require('./action-handler');
+const { userResumed, userRequestedSilence } = require('./scheduler');
 const db = require('./database');
 
 function createBot() {
   const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
-
-  // ---- COMANDOS ----
 
   bot.command('start', async (ctx) => {
     await ctx.reply(
       '💪 ¡Vamos allá!\n\n' +
       'Soy tu coach personal. Voy a empujarte a ser la mejor versión de ti mismo ' +
       'en tres pilares: CUERPO, HOGAR y TRABAJO.\n\n' +
-      'Para empezar, cuéntame:\n' +
-      '1. ¿Cuáles son tus objetivos principales?\n' +
-      '2. ¿Cómo es tu rutina actual de gym?\n' +
-      '3. ¿Cuánto quieres facturar al mes?\n' +
-      '4. ¿Qué perfumes/productos tienes?\n\n' +
+      'Para empezar, cuéntame sobre ti: objetivos, rutinas, inventario.\n' +
       'O simplemente háblame y vamos configurando sobre la marcha.'
     );
   });
@@ -28,35 +23,30 @@ function createBot() {
     const weekRevenue = db.getWeekRevenue();
     const goals = db.getActiveGoals();
     
-    let status = '📊 **ESTADO DEL DÍA**\n\n';
+    let status = '📊 ESTADO DEL DÍA\n\n';
     
-    // Tareas
     const pending = tasks.filter(t => t.status === 'pending');
     const done = tasks.filter(t => t.status === 'done');
-    status += `✅ Tareas completadas: ${done.length}\n`;
-    status += `⏳ Tareas pendientes: ${pending.length}\n`;
+    status += `Tareas completadas: ${done.length}\n`;
+    status += `Tareas pendientes: ${pending.length}\n`;
     if (pending.length > 0) {
-      status += pending.map(t => `   → ${t.description}`).join('\n') + '\n';
+      status += pending.map(t => `  → ${t.description}`).join('\n') + '\n';
     }
     
-    // Registro
-    status += `\n📝 Registros hoy: ${todayLog.length}\n`;
+    status += `\nRegistros hoy: ${todayLog.length}\n`;
+    status += `\nFacturación semana: ${weekRevenue}€\n`;
     
-    // Facturación
-    status += `\n💰 Facturación semana: ${weekRevenue}€\n`;
-    
-    // Objetivos
     if (goals.length > 0) {
-      status += '\n🎯 **OBJETIVOS**\n';
+      status += '\nOBJETIVOS\n';
       goals.forEach(g => {
         const pct = g.target_value > 0 
           ? Math.round((g.current_value / g.target_value) * 100) 
           : 0;
-        status += `   [${g.pillar.toUpperCase()}] ${g.title}: ${g.current_value}/${g.target_value} ${g.unit || ''} (${pct}%)\n`;
+        status += `  [${g.pillar.toUpperCase()}] ${g.title}: ${g.current_value}/${g.target_value} ${g.unit || ''} (${pct}%)\n`;
       });
     }
     
-    await ctx.reply(status, { parse_mode: 'Markdown' });
+    await ctx.reply(status);
   });
 
   bot.command('semana', async (ctx) => {
@@ -69,15 +59,12 @@ function createBot() {
 
   bot.command('config', async (ctx) => {
     await ctx.reply(
-      '⚙️ **CONFIGURACIÓN**\n\n' +
       'Dime qué quieres configurar:\n' +
       '• "Mi objetivo de facturación semanal es 2000€"\n' +
       '• "Voy al gym lunes, miércoles y viernes"\n' +
       '• "Mi dieta es: 2500 calorías, 180g proteína"\n' +
-      '• "Tengo estos perfumes: Dior Sauvage, Bleu de Chanel"\n' +
-      '• "Quiero que me despiertes a las 7:00"\n\n' +
-      'Simplemente escríbeme y yo lo configuro.',
-      { parse_mode: 'Markdown' }
+      '• "Tengo estos perfumes: Dior Sauvage, Bleu de Chanel"\n\n' +
+      'Simplemente escríbeme y yo lo configuro.'
     );
   });
 
@@ -88,10 +75,10 @@ function createBot() {
     if (levels.includes(text)) {
       db.setConfig('intensity', text);
       const msgs = {
-        low: '😊 Modo suave activado. Te sugeriré cosas sin presionar.',
-        medium: '💪 Modo medio. Directo pero empático.',
-        high: '🔥 Modo alto. Sin excusas, sin contemplaciones.',
-        savage: '☠️ Modo SAVAGE activado. Prepárate para sufrir.',
+        low: 'Modo suave activado. Te sugeriré cosas sin presionar.',
+        medium: 'Modo medio. Directo pero empático.',
+        high: 'Modo alto. Sin excusas, sin contemplaciones.',
+        savage: 'Modo SAVAGE activado. Prepárate.',
       };
       await ctx.reply(msgs[text]);
     } else {
@@ -107,12 +94,101 @@ function createBot() {
 
   bot.command('silencio', async (ctx) => {
     db.setConfig('silent_mode', 'true');
-    await ctx.reply('🔇 Modo silencio activado. No te enviaré mensajes proactivos hasta que pongas /activo');
+    userRequestedSilence();
+    await ctx.reply('Modo silencio activado. No te enviaré mensajes hasta que pongas /activo');
   });
 
   bot.command('activo', async (ctx) => {
     db.setConfig('silent_mode', 'false');
-    await ctx.reply('🔔 ¡De vuelta! Modo activo. Vamos a por ello.');
+    userResumed();
+    await ctx.reply('De vuelta. Modo activo.');
+  });
+
+  // ---- FOTOS ----
+  bot.on('message:photo', async (ctx) => {
+    console.log('📸 Foto recibida');
+    await ctx.replyWithChatAction('typing');
+    
+    try {
+      const photo = ctx.message.photo[ctx.message.photo.length - 1];
+      const file = await ctx.api.getFile(photo.file_id);
+      const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+      
+      const response = await fetch(fileUrl);
+      const arrayBuffer = await response.arrayBuffer();
+      const base64 = Buffer.from(arrayBuffer).toString('base64');
+      
+      const caption = ctx.message.caption || 'El usuario te envía esta foto. Si es un look/outfit, evalúalo del 1 al 10 y da feedback específico. Si es comida, estima macros. Si es otra cosa, comenta lo que veas relevante.';
+      
+      const Anthropic = require('@anthropic-ai/sdk');
+      const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+      
+      const { buildSystemPrompt } = require('./prompts/system');
+      
+      const profile = db.getProfile();
+      const goals = db.getActiveGoals();
+      const inventory = db.getInventory();
+      const routines = db.getRoutines();
+      const tasks = db.getTodayTasks();
+      const todayLog = db.getTodayLog();
+      const config = db.getAllConfig();
+      const revenueData = {
+        weekTotal: db.getWeekRevenue(),
+        monthTotal: db.getMonthRevenue(),
+        weekGoal: config.week_revenue_goal || null,
+        monthGoal: config.month_revenue_goal || null,
+      };
+      
+      const systemPrompt = buildSystemPrompt(
+        profile, goals, inventory, routines, tasks, todayLog, revenueData, config
+      );
+      
+      const result = await anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1024,
+        system: systemPrompt,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64 } },
+            { type: 'text', text: caption }
+          ]
+        }],
+      });
+      
+      const responseText = result.content[0].text;
+      let parsed;
+      try {
+        parsed = JSON.parse(responseText);
+      } catch {
+        const jsonMatch = responseText.match(/```json\n?([\s\S]*?)\n?```/);
+        if (jsonMatch) {
+          parsed = JSON.parse(jsonMatch[1]);
+        } else {
+          parsed = { message: responseText, actions: [] };
+        }
+      }
+      
+      if (parsed.actions && parsed.actions.length > 0) {
+        processActions(parsed.actions);
+      }
+      
+      const message = parsed.message;
+      if (message.length <= 4096) {
+        await ctx.reply(message);
+      } else {
+        for (let i = 0; i < message.length; i += 4096) {
+          await ctx.reply(message.substring(i, i + 4096));
+        }
+      }
+      
+      db.addConversation('user', '[FOTO] ' + caption);
+      db.addConversation('assistant', parsed.message);
+      
+    } catch (error) {
+      console.error('Error procesando foto:', error);
+      await ctx.reply('No pude procesar la foto. Inténtalo de nuevo.');
+    }
   });
 
   // ---- MENSAJES NORMALES ----
@@ -121,25 +197,27 @@ function createBot() {
     
     console.log(`📨 Mensaje recibido: ${userMessage.substring(0, 50)}...`);
     
-    // Mostrar "escribiendo..."
+    // Detectar si el usuario pide silencio o retoma
+    const lower = userMessage.toLowerCase();
+    if (lower.includes('para ya') || lower.includes('deja de') || lower.includes('no me escribas') || lower.includes('cállate') || lower.includes('silencio') || lower.includes('no me mandes')) {
+      userRequestedSilence();
+    } else {
+      userResumed();
+    }
+    
     await ctx.replyWithChatAction('typing');
     
-    // Enviar a Claude
     const response = await chat(userMessage);
     
-    // Procesar acciones
     if (response.actions && response.actions.length > 0) {
       console.log(`⚡ Procesando ${response.actions.length} acciones...`);
       processActions(response.actions);
     }
     
-    // Responder
-    // Telegram tiene límite de 4096 caracteres, dividir si es necesario
     const message = response.message;
     if (message.length <= 4096) {
       await ctx.reply(message);
     } else {
-      // Dividir en chunks
       for (let i = 0; i < message.length; i += 4096) {
         await ctx.reply(message.substring(i, i + 4096));
       }

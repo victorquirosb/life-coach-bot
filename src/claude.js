@@ -7,7 +7,6 @@ const anthropic = new Anthropic({
 });
 
 async function chat(userMessage, triggerContext = null) {
-  // 1. Recopilar todo el contexto
   const profile = db.getProfile();
   const goals = db.getActiveGoals();
   const inventory = db.getInventory();
@@ -23,69 +22,89 @@ async function chat(userMessage, triggerContext = null) {
     monthGoal: config.month_revenue_goal || null,
   };
 
-  // 2. Construir system prompt
   const systemPrompt = buildSystemPrompt(
     profile, goals, inventory, routines, tasks, todayLog, revenueData, config
   );
 
-  // 3. Construir mensajes con historial (filtrar vacíos)
+  // Construir mensajes con historial (filtrar vacíos y duplicados)
   const history = db.getRecentConversations(20);
-  const messages = history
-    .filter(h => h.content && h.content.trim() !== '')
-    .map(h => ({
-      role: h.role,
-      content: h.content,
-    }));
+  const messages = [];
+  let lastRole = null;
+  let lastContent = null;
+  
+  for (const h of history) {
+    if (!h.content || h.content.trim() === '') continue;
+    if (h.content === lastContent) continue;
+    if (h.role === lastRole && messages.length > 0) {
+      messages[messages.length - 1].content += '\n' + h.content;
+      lastContent = h.content;
+      continue;
+    }
+    messages.push({ role: h.role, content: h.content });
+    lastRole = h.role;
+    lastContent = h.content;
+  }
 
-  // Añadir contexto del trigger si es proactivo
   let fullMessage = userMessage;
   if (triggerContext) {
     fullMessage = `[CONTEXTO DEL SISTEMA - el bot está iniciando contacto proactivo]
 Tipo de trigger: ${triggerContext.type}
 Contexto: ${triggerContext.context}
+HORA REAL ACTUAL: ${new Date().toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })}
 [FIN CONTEXTO]
 
 Genera un mensaje proactivo apropiado para este momento. NO digas que eres un bot ni 
 que esto es automático. Escribe como si fueras un amigo que le escribe en ese momento.`;
   }
 
-  messages.push({ role: 'user', content: fullMessage });
+  if (fullMessage && fullMessage.trim() !== '') {
+    messages.push({ role: 'user', content: fullMessage });
+  } else {
+    messages.push({ role: 'user', content: 'Genera un mensaje proactivo basado en el contexto actual del usuario.' });
+  }
 
-  // 4. Llamar a Claude
+  // Asegurar que los mensajes alternan correctamente
+  const cleanMessages = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (i === 0 && messages[i].role === 'assistant') continue;
+    if (cleanMessages.length > 0 && cleanMessages[cleanMessages.length - 1].role === messages[i].role) {
+      cleanMessages[cleanMessages.length - 1].content += '\n' + messages[i].content;
+    } else {
+      cleanMessages.push({ ...messages[i] });
+    }
+  }
+
   try {
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 1024,
       system: systemPrompt,
-      messages: messages,
+      messages: cleanMessages,
     });
 
     const responseText = response.content[0].text;
 
-    // 5. Parsear respuesta JSON
     let parsed;
     try {
-      // Intentar parsear directamente
       parsed = JSON.parse(responseText);
     } catch {
-      // Si falla, intentar extraer JSON del texto
       const jsonMatch = responseText.match(/```json\n?([\s\S]*?)\n?```/);
       if (jsonMatch) {
         parsed = JSON.parse(jsonMatch[1]);
       } else {
-        // Fallback: devolver el texto como mensaje
         parsed = { message: responseText, actions: [] };
       }
     }
 
-    // 6. Guardar en historial
-    db.addConversation('user', userMessage);
+    if (userMessage && userMessage.trim() !== '') {
+      db.addConversation('user', userMessage);
+    }
     db.addConversation('assistant', parsed.message);
 
     return parsed;
 
   } catch (error) {
-    console.error('Error llamando a Claude:', error);
+    console.error('Error llamando a Claude:', error.message);
     return {
       message: 'Tengo un problema técnico ahora mismo. Dame un minuto y vuelve a intentarlo.',
       actions: [],
